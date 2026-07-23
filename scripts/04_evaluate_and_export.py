@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from ml_utils import (
@@ -37,70 +38,92 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def merged_reason_codes(row: pd.Series) -> str:
-    reasons = [
-        reason
-        for reason in str(row.get("reason_codes", "")).split("|")
-        if reason and reason != "nan"
-    ]
-
-    if row["best_model_probability"] >= 0.65:
-        reasons.append("model_decline_risk")
-    if row["best_model_probability"] >= 0.5 and row["impressions_90d"] >= 500:
-        reasons.append("visible_model_opportunity")
-    if (
-        row["impressions_90d"] >= 500
-        and row["avg_position"] > 0
-        and row["avg_position"] <= 20
-        and row["ctr"] < 0.5
-    ):
-        reasons.append("ctr_review_candidate")
-    if row["sessions_90d"] >= 30 and (
-        (row["engagement_rate"] > 0 and row["engagement_rate"] < 30)
-        or (row["scroll_rate"] > 0 and row["scroll_rate"] < 30)
-    ):
-        reasons.append("engagement_review_candidate")
-
-    unique_reasons = []
-    for reason in reasons:
-        if reason not in unique_reasons:
-            unique_reasons.append(reason)
-    return "|".join(unique_reasons or ["general_refresh_review"])
+def add_reason_code(frame: pd.DataFrame, mask: pd.Series, code: str) -> None:
+    frame.loc[mask, "final_reason_codes"] = frame.loc[mask, "final_reason_codes"].str.replace(
+        "general_refresh_review",
+        "",
+        regex=False,
+    )
+    frame.loc[mask, "final_reason_codes"] = np.where(
+        frame.loc[mask, "final_reason_codes"].eq(""),
+        code,
+        frame.loc[mask, "final_reason_codes"] + "|" + code,
+    )
 
 
-def suggested_action(row: pd.Series) -> str:
-    reasons = set(str(row["final_reason_codes"]).split("|"))
-    if "thin_visible_page" in reasons:
-        return "expand_and_refresh"
-    if "ctr_review_candidate" in reasons and (
-        "model_decline_risk" in reasons or "declining_with_demand" in reasons
-    ):
-        return "refresh_and_review_ctr"
-    if "engagement_review_candidate" in reasons and (
-        "model_decline_risk" in reasons or "declining_with_demand" in reasons
-    ):
-        return "refresh_and_review_engagement"
-    if {
+def assign_final_reason_codes(frame: pd.DataFrame) -> pd.DataFrame:
+    frame["final_reason_codes"] = (
+        frame["reason_codes"]
+        .fillna("")
+        .astype(str)
+        .str.strip("|")
+        .replace({"": "general_refresh_review", "nan": "general_refresh_review"})
+    )
+    add_reason_code(
+        frame,
+        frame["best_model_probability"] >= 0.65,
         "model_decline_risk",
-        "declining_with_demand",
-        "stale_visible_page",
+    )
+    add_reason_code(
+        frame,
+        (frame["best_model_probability"] >= 0.5) & (frame["impressions_90d"] >= 500),
         "visible_model_opportunity",
-    }.intersection(reasons):
-        return "refresh"
-    return "monitor"
+    )
+    add_reason_code(
+        frame,
+        (frame["impressions_90d"] >= 500)
+        & (frame["avg_position"] > 0)
+        & (frame["avg_position"] <= 20)
+        & (frame["ctr"] < 0.5),
+        "ctr_review_candidate",
+    )
+    add_reason_code(
+        frame,
+        (frame["sessions_90d"] >= 30)
+        & (
+            ((frame["engagement_rate"] > 0) & (frame["engagement_rate"] < 30))
+            | ((frame["scroll_rate"] > 0) & (frame["scroll_rate"] < 30))
+        ),
+        "engagement_review_candidate",
+    )
+    frame["final_reason_codes"] = (
+        frame["final_reason_codes"]
+        .str.replace(r"^\|+|\|+$", "", regex=True)
+        .mask(frame["final_reason_codes"].eq(""), "general_refresh_review")
+    )
+    return frame
 
 
-def confidence_label(row: pd.Series, high_threshold: float, medium_threshold: float) -> str:
-    if (
-        row["final_refresh_score"] >= high_threshold
-        and row["impressions_90d"] >= 500
-        and row["sessions_90d"] >= 10
-        and row["best_model_probability"] >= 0.5
-    ):
-        return "high"
-    if row["final_refresh_score"] >= medium_threshold:
-        return "medium"
-    return "low"
+def assign_suggested_actions(frame: pd.DataFrame) -> pd.DataFrame:
+    has_thin = frame["final_reason_codes"].str.contains("thin_visible_page", regex=False)
+    has_ctr = frame["final_reason_codes"].str.contains("ctr_review_candidate", regex=False)
+    has_engagement = frame["final_reason_codes"].str.contains("engagement_review_candidate", regex=False)
+    has_decline = frame["final_reason_codes"].str.contains("model_decline_risk|declining_with_demand", regex=True)
+    has_refresh_signal = frame["final_reason_codes"].str.contains(
+        "model_decline_risk|declining_with_demand|stale_visible_page|visible_model_opportunity",
+        regex=True,
+    )
+    frame["suggested_action"] = np.select(
+        [has_thin, has_ctr & has_decline, has_engagement & has_decline, has_refresh_signal],
+        ["expand_and_refresh", "refresh_and_review_ctr", "refresh_and_review_engagement", "refresh"],
+        default="monitor",
+    )
+    return frame
+
+
+def assign_confidence(frame: pd.DataFrame, high_threshold: float, medium_threshold: float) -> pd.DataFrame:
+    high_mask = (
+        (frame["final_refresh_score"] >= high_threshold)
+        & (frame["impressions_90d"] >= 500)
+        & (frame["sessions_90d"] >= 10)
+        & (frame["best_model_probability"] >= 0.5)
+    )
+    frame["confidence"] = np.select(
+        [high_mask, frame["final_refresh_score"] >= medium_threshold],
+        ["high", "medium"],
+        default="low",
+    )
+    return frame
 
 
 def metric_table(model_results: dict) -> str:
@@ -329,14 +352,11 @@ def main() -> None:
         )
     ).clip(0, 100)
 
-    final_frame["final_reason_codes"] = final_frame.apply(merged_reason_codes, axis=1)
-    final_frame["suggested_action"] = final_frame.apply(suggested_action, axis=1)
+    final_frame = assign_final_reason_codes(final_frame)
+    final_frame = assign_suggested_actions(final_frame)
     high_threshold = float(final_frame["final_refresh_score"].quantile(0.8))
     medium_threshold = float(final_frame["final_refresh_score"].quantile(0.5))
-    final_frame["confidence"] = final_frame.apply(
-        lambda row: confidence_label(row, high_threshold, medium_threshold),
-        axis=1,
-    )
+    final_frame = assign_confidence(final_frame, high_threshold, medium_threshold)
     final_frame = final_frame.sort_values(
         ["final_refresh_score", "impressions_90d", "sessions_90d"],
         ascending=[False, False, False],

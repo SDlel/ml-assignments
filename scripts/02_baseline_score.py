@@ -20,37 +20,71 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def reason_codes(row: pd.Series) -> list[str]:
-    reasons: list[str] = []
-    if row["days_since_last_update"] >= 180 and row["impressions_90d"] >= 500:
-        reasons.append("stale_visible_page")
-    if row["trend_direction"].lower() == "down" and row["impressions_90d"] >= 100:
-        reasons.append("declining_with_demand")
-    if row["word_count"] > 0 and row["word_count"] < 1200 and row["impressions_90d"] >= 250:
-        reasons.append("thin_visible_page")
-    if row["avg_position"] > 0 and row["avg_position"] <= 10 and row["content_age_days"] >= 180:
-        reasons.append("page_one_decay_risk")
-    if row["impressions_90d"] >= 500 and 0 < row["avg_position"] <= 20 and row["ctr"] < 0.5:
-        reasons.append("low_ctr_visible_page")
-    if row["sessions_90d"] >= 30 and (
-        (row["engagement_rate"] > 0 and row["engagement_rate"] < 30)
-        or (row["scroll_rate"] > 0 and row["scroll_rate"] < 30)
-    ):
-        reasons.append("low_engagement_visible_page")
-    if not reasons:
-        reasons.append("general_refresh_review")
-    return reasons
+def add_reason_code(frame: pd.DataFrame, mask: pd.Series, code: str) -> None:
+    frame.loc[mask, "reason_codes"] = np.where(
+        frame.loc[mask, "reason_codes"].eq(""),
+        code,
+        frame.loc[mask, "reason_codes"] + "|" + code,
+    )
 
 
-def suggested_action(row: pd.Series) -> str:
-    reasons = set(str(row["reason_codes"]).split("|"))
-    if "thin_visible_page" in reasons:
-        return "expand_and_refresh"
-    if "low_ctr_visible_page" in reasons:
-        return "refresh_and_review_ctr"
-    if "stale_visible_page" in reasons or "declining_with_demand" in reasons:
-        return "refresh"
-    return "monitor"
+def assign_reason_codes(frame: pd.DataFrame) -> pd.DataFrame:
+    frame["reason_codes"] = ""
+    add_reason_code(
+        frame,
+        (frame["days_since_last_update"] >= 180) & (frame["impressions_90d"] >= 500),
+        "stale_visible_page",
+    )
+    add_reason_code(
+        frame,
+        frame["trend_direction"].str.lower().eq("down") & (frame["impressions_90d"] >= 100),
+        "declining_with_demand",
+    )
+    add_reason_code(
+        frame,
+        (frame["word_count"] > 0) & (frame["word_count"] < 1200) & (frame["impressions_90d"] >= 250),
+        "thin_visible_page",
+    )
+    add_reason_code(
+        frame,
+        (frame["avg_position"] > 0) & (frame["avg_position"] <= 10) & (frame["content_age_days"] >= 180),
+        "page_one_decay_risk",
+    )
+    add_reason_code(
+        frame,
+        (frame["impressions_90d"] >= 500)
+        & (frame["avg_position"] > 0)
+        & (frame["avg_position"] <= 20)
+        & (frame["ctr"] < 0.5),
+        "low_ctr_visible_page",
+    )
+    add_reason_code(
+        frame,
+        (frame["sessions_90d"] >= 30)
+        & (
+            ((frame["engagement_rate"] > 0) & (frame["engagement_rate"] < 30))
+            | ((frame["scroll_rate"] > 0) & (frame["scroll_rate"] < 30))
+        ),
+        "low_engagement_visible_page",
+    )
+    frame["reason_codes"] = frame["reason_codes"].mask(
+        frame["reason_codes"].eq(""),
+        "general_refresh_review",
+    )
+    return frame
+
+
+def assign_suggested_actions(frame: pd.DataFrame) -> pd.DataFrame:
+    frame["suggested_action_baseline"] = np.select(
+        [
+            frame["reason_codes"].str.contains("thin_visible_page", regex=False),
+            frame["reason_codes"].str.contains("low_ctr_visible_page", regex=False),
+            frame["reason_codes"].str.contains("stale_visible_page|declining_with_demand", regex=True),
+        ],
+        ["expand_and_refresh", "refresh_and_review_ctr", "refresh"],
+        default="monitor",
+    )
+    return frame
 
 
 def main() -> None:
@@ -75,8 +109,8 @@ def main() -> None:
         + 0.05 * df["depth_gap_score"]
     ).clip(0, 1)
 
-    df["reason_codes"] = df.apply(lambda row: "|".join(reason_codes(row)), axis=1)
-    df["suggested_action_baseline"] = df.apply(suggested_action, axis=1)
+    df = assign_reason_codes(df)
+    df = assign_suggested_actions(df)
     df["baseline_rank"] = df["baseline_refresh_score"].rank(method="first", ascending=False).astype(int)
 
     output_columns = [
